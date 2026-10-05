@@ -136,12 +136,13 @@
   //          罠枠、逆に放置すれば赤になっても無害)。
   const SPECIES = ['plain', 'orangeStart', 'camo', 'camoblue', 'plague'];
   function levelParams(lv) {
-    if (lv === 0) return { interval: 45, weights: [2, 2, 0, 0, 1] };
-    if (lv === 1) return { interval: 38, weights: [1, 1, 1, 0, 1] };
-    if (lv === 2) return { interval: 30, weights: [1, 1, 1, 1, 1] };
-    if (lv === 3) return { interval: 30, weights: [1, 1, 3, 3, 1] };
-    if (lv === 4) return { interval: 25, weights: [1, 2, 3, 3, 1] };
-    return { interval: 20, weights: [1, 2, 3, 3, 1] };
+    // 実機の間隔から2割短縮(2026-10-05: 最初からもう少しテンポアップしたい、との要望)
+    if (lv === 0) return { interval: 36, weights: [2, 2, 0, 0, 1] };
+    if (lv === 1) return { interval: 30, weights: [1, 1, 1, 0, 1] };
+    if (lv === 2) return { interval: 24, weights: [1, 1, 1, 1, 1] };
+    if (lv === 3) return { interval: 24, weights: [1, 1, 3, 3, 1] };
+    if (lv === 4) return { interval: 20, weights: [1, 2, 3, 3, 1] };
+    return { interval: 16, weights: [1, 2, 3, 3, 1] };
   }
   function pickSpecies(weights) {
     const total = weights.reduce((a, b) => a + b, 0);
@@ -174,9 +175,9 @@
     return 1;
   }
   // 経過時間だけで決まるテンポアップ係数(スコアでのレベルアップとは独立)。
-  // 2分かけて出現間隔を最大35%短縮する。
+  // 開始直後から10%は効かせておき、そこから約3分かけて最大40%まで短縮する。
   function tempoSpeedup(elapsed) {
-    return Math.min(0.35, elapsed / 340000);
+    return Math.min(0.4, 0.1 + elapsed / 300000);
   }
 
   function freeSlotIndexes() {
@@ -193,7 +194,7 @@
       slotIdx, species,
       frame: 0, ageMs: 0, hitStage: 0, dead: false, deadAt: 0, born: performance.now(),
       flinchUntilFrame: 0,
-      tapped: false, resolved: false, plagueOutPlayed: false,
+      resolved: false, plagueOutPlayed: false, dodges: 0,
       redOffsetIdx: 1 + Math.floor(Math.random() * 3), // RED_OFFSETS[1..3]
     });
   }
@@ -294,13 +295,14 @@
         }
       } else if (b.species === 'camoblue') {
         // ワープ系のハズレ枠: タップしても得点にならず別の穴へ逃げるだけ。
-        // 赤になれば叩いても叩かなくても必ずライフが減る(回避不可能)。
-        if (!b.tapped) {
-          b.tapped = true;
+        // 3回までは逃げられる(忙しさを出すため)。赤になれば叩いても
+        // 叩かなくても必ずライフが減る(回避不可能)。
+        if (b.dodges < 3) {
+          b.dodges++;
           play('clic2x');
           relocateBlob(b);
         } else {
-          // 既に一度逃げた後の再タップ。効果はないが、無視されたように
+          // 逃げ切った後の再タップ。効果はないが、無視されたように
           // 見えないよう、触れたことだけは分かる軽いフィードバックを返す。
           poofAt(b.slotIdx, 4, 20, 60);
         }
