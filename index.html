@@ -216,10 +216,25 @@
     }
   }
 
+  function poofAt(slotIdx, n, spdMin, spdMax) {
+    const slot = slots[slotIdx];
+    for (let i = 0; i < n; i++) {
+      const ang = Math.random() * Math.PI * 2, spd = spdMin + Math.random() * (spdMax - spdMin);
+      particles.push({ x: slot.x, y: slot.y, vx: Math.cos(ang) * spd, vy: Math.sin(ang) * spd - 40, life: 300 + Math.random() * 200, born: performance.now(), size: 2 + Math.random() * 4 });
+    }
+  }
+
+  // タップした瞬間に必ず何か見える反応を残す(逃げ先が無くて移動できない時も、
+  // 無言で無視されたように見えないようにする)。
   function relocateBlob(b) {
+    const oldSlot = b.slotIdx;
+    poofAt(oldSlot, 10, 70, 180); // タップした場所に必ず「逃げた」演出
     const free = freeSlotIndexes();
-    if (!free.length) return;
+    if (!free.length) return false;
     b.slotIdx = free[Math.floor(Math.random() * free.length)];
+    b.ageMs = 0; // 新しい穴でポップイン演出をやり直す(移動が分かりやすいように)
+    poofAt(b.slotIdx, 6, 40, 110); // 移動先にも小さく到着演出
+    return true;
   }
 
   function loseLife() {
@@ -284,6 +299,10 @@
           b.tapped = true;
           play('clic2x');
           relocateBlob(b);
+        } else {
+          // 既に一度逃げた後の再タップ。効果はないが、無視されたように
+          // 見えないよう、触れたことだけは分かる軽いフィードバックを返す。
+          poofAt(b.slotIdx, 4, 20, 60);
         }
       } else if (b.species === 'plague') {
         // 罠枠: 触った瞬間に即ライフ減。放置すれば赤になっても無害に消える。
