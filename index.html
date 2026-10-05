@@ -1,0 +1,431 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>ブロブたたき (Smack That Gugl 完全再現版)</title>
+<style>
+  :root { color-scheme: light; }
+  html,body { margin:0; padding:0; width:100%; height:100%; overflow:hidden; background:#9acd00; touch-action:none; -webkit-user-select:none; user-select:none; }
+  #stage { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { touch-action:none; display:block; }
+  #hud { position:fixed; top:0; left:0; right:0; padding:10px 16px; padding-top:calc(10px + env(safe-area-inset-top,0px)); display:flex; justify-content:space-between; font:bold 18px/1.2 -apple-system,system-ui,sans-serif; color:#fff; text-shadow:0 2px 4px rgba(0,0,0,.35); pointer-events:none; z-index:5; }
+  .screen { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:18px; background:#9acd00; z-index:10; }
+  .screen[hidden]{ display:none; }
+  .blob-deco { width:36vw; max-width:190px; filter:drop-shadow(0 10px 18px rgba(0,0,0,.25)); }
+  .banner { width:60vw; max-width:280px; }
+  .btn { border:0; background:none; padding:0; cursor:pointer; -webkit-tap-highlight-color:transparent; }
+  .btn img { width:34vw; max-width:150px; display:block; }
+  .scoreline { font:bold 20px -apple-system,system-ui,sans-serif; color:#2e3d00; text-align:center; }
+  .scoreline b { font-size:48px; display:block; color:#fff; -webkit-text-stroke:2px #2e3d00; text-shadow:0 4px 0 #2e3d00; }
+  .small { font:600 14px -apple-system,system-ui,sans-serif; color:#3a4a00; opacity:.85; text-align:center; max-width:80vw; line-height:1.6; }
+</style>
+</head>
+<body>
+
+<div id="titleScreen" class="screen">
+  <img class="blob-deco" src="assets/img/blob.png" alt="">
+  <img class="banner" src="assets/img/go_banner.png" alt="Go!">
+  <button class="btn" id="startBtn"><img src="assets/img/start_button.png" alt="Start"></button>
+  <div class="small">ライフは5。ブロブが緑→オレンジ→赤に変わる前にタップ！<br>赤になりきると自動でライフが減ります。<br>カモ柄は2回タップで倒せます。<br>青カモはタップしても得点にならず、赤になると必ずライフが減ります。<br>⚠マークが出てるブロブ(プレイグ)はタップすると即ライフが減るので放置してください。</div>
+</div>
+
+<div id="resultScreen" class="screen" hidden>
+  <div class="scoreline">SCORE<b id="finalScore">0</b></div>
+  <div class="small" id="hiscoreLine"></div>
+  <button class="btn" id="retryBtn"><img src="assets/img/start_button.png" alt="もう一度"></button>
+</div>
+
+<div id="hud" hidden>
+  <div id="scoreHud">SCORE 0</div>
+  <div id="livesHud">♥♥♥♥♥</div>
+</div>
+
+<div id="stage"><canvas id="c"></canvas></div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  const titleScreen = document.getElementById('titleScreen');
+  const resultScreen = document.getElementById('resultScreen');
+  const hud = document.getElementById('hud');
+  const scoreHud = document.getElementById('scoreHud');
+  const livesHud = document.getElementById('livesHud');
+  const finalScoreEl = document.getElementById('finalScore');
+  const hiscoreLine = document.getElementById('hiscoreLine');
+
+  let W = 0, H = 0, DPR = Math.min(2, window.devicePixelRatio || 1);
+  function resize() {
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = W * DPR; canvas.height = H * DPR;
+    canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    layoutSlots();
+  }
+  window.addEventListener('resize', resize);
+
+  const imgGreen = new Image(); imgGreen.src = 'assets/img/gugl_green.png';
+  const imgOrange = new Image(); imgOrange.src = 'assets/img/gugl_orange.png';
+  const imgRed = new Image(); imgRed.src = 'assets/img/gugl_red.png';
+  const imgCamo = new Image(); imgCamo.src = 'assets/img/gugl_camo.png';
+  const imgCamoBlue = new Image(); imgCamoBlue.src = 'assets/img/gugl_camoblue.png';
+  const imgPlague = new Image(); imgPlague.src = 'assets/img/gugl_plague.png';
+  const imgAvoid = new Image(); imgAvoid.src = 'assets/img/avoidplagued.png';
+  const FRAME = 128;
+
+  // 実機解析結果: 1コマ送り(インデックス+1)は描画ループ3回分(≒90ms)。
+  // 0〜11コマが「穴から出てくる」動き、12コマ以降は出きった状態でのアイドル揺れ。
+  // 緑(0〜23)・橙(24〜43)は同じオフセット表を共有(橙に入っても表はリセットされない)。
+  const BLOB_OFFSETS = [
+    [0, 0], [128, 0], [256, 0], [384, 0],
+    [0, 128], [128, 128], [256, 128], [384, 128],
+    [0, 256], [128, 256], [256, 256], [384, 256],
+  ];
+  function blobOffsetAt(idx) {
+    if (idx < BLOB_OFFSETS.length) return BLOB_OFFSETS[idx];
+    return (idx % 4 < 2) ? [256, 256] : [384, 256]; // 出現後のアイドル揺れループ
+  }
+  const RED_OFFSETS = [[0, 0], [128, 0], [0, 128], [128, 128]];
+  const TICK_MS = 30;      // 実機の描画ループ間隔
+  const COLOR_STEP_TICKS = 3; // 1コマ送りに必要なティック数(h=3)
+  const GREEN_END = 24 * COLOR_STEP_TICKS;  // 72 ticks
+  const ORANGE_END = 44 * COLOR_STEP_TICKS; // 132 ticks
+
+  const snd = {};
+  function loadSnd(name) { const a = new Audio('assets/snd/' + name + '.wav'); a.preload = 'auto'; return a; }
+  ['button', 'clic2x', 'failed1', 'failed2', 'failed3', 'go', 'hiscore', 'home', 'level',
+    'ouch00', 'ouch01', 'ouch02', 'ouch03', 'ouch04', 'ouch05', 'ouch06', 'ouch07', 'ouch08', 'ouch09',
+    'piu1', 'piu2', 'plague_in', 'plague_out', 'red', 'schlops01'].forEach(n => snd[n] = loadSnd(n));
+  function play(name) { try { const i = snd[name].cloneNode(); i.play().catch(() => {}); } catch (e) {} }
+  function playRandomOuch() { play('ouch0' + Math.floor(Math.random() * 10)); }
+
+  // ---- real spawn grid from the decompiled game: 4 cols x 6 rows, 24 slots,
+  // logical spacing 80 units in an original ~320-wide field. We scale that
+  // proportionally to the actual viewport width. ----
+  const GRID_COLS = 4, GRID_ROWS = 6;
+  const LOGICAL_W = 320, LOGICAL_CELL = 80;
+  let slots = [];
+  function layoutSlots() {
+    slots = [];
+    const scale = (W * 0.86) / LOGICAL_W;
+    const cell = LOGICAL_CELL * scale;
+    const originX = (W - cell * GRID_COLS) / 2;
+    const originY = H * 0.16;
+    for (let r = 0; r < GRID_ROWS; r++) {
+      for (let c = 0; c < GRID_COLS; c++) {
+        slots.push({ x: originX + cell * c + cell / 2, y: originY + cell * r + cell / 2, size: cell * 1.5 });
+      }
+    }
+  }
+
+  // ---- state, matching the decompiled SmackThatGugl/e.java state machine ----
+  let state = 'title';
+  let score = 0, lives = 5, level = 0, nextLevelScore = 100;
+  let spawnTimer = 0; // raw ticks (TICK_MS each), matches original A()-per-frame cadence
+  let blobs = []; // active {slotIdx,species,frame,hitStage,tapped,resolved,dead,deadAt,...}
+  let particles = [];
+  let lastTick = 0;
+  const HISCORE_KEY = 'smack_blob_hiscore_v2';
+
+  // 実機のe.java b()から解析した、レベルごとの出現間隔(ticks)と5種族の出現比率。
+  // SPECIES: 0=plain(緑→橙→赤,1発), 1=orangeStart(橙→赤のみ,1発,露出時間半分),
+  //          2=camo(2発), 3=camoblue(叩いても得点にならずワープして逃げる、赤に
+  //          なると必ずライフ減=回避不可能なハズレ枠), 4=plague(叩くと即ライフ減の
+  //          罠枠、逆に放置すれば赤になっても無害)。
+  const SPECIES = ['plain', 'orangeStart', 'camo', 'camoblue', 'plague'];
+  function levelParams(lv) {
+    if (lv === 0) return { interval: 45, weights: [2, 2, 0, 0, 1] };
+    if (lv === 1) return { interval: 38, weights: [1, 1, 1, 0, 1] };
+    if (lv === 2) return { interval: 30, weights: [1, 1, 1, 1, 1] };
+    if (lv === 3) return { interval: 30, weights: [1, 1, 3, 3, 1] };
+    if (lv === 4) return { interval: 25, weights: [1, 2, 3, 3, 1] };
+    return { interval: 20, weights: [1, 2, 3, 3, 1] };
+  }
+  function pickSpecies(weights) {
+    const total = weights.reduce((a, b) => a + b, 0);
+    let r = Math.random() * total;
+    for (let i = 0; i < weights.length; i++) {
+      if (r < weights[i]) return SPECIES[i];
+      r -= weights[i];
+    }
+    return SPECIES[SPECIES.length - 1];
+  }
+
+  function freeSlotIndexes() {
+    const occupied = new Set(blobs.filter(b => !b.dead).map(b => b.slotIdx));
+    const free = [];
+    for (let i = 0; i < slots.length; i++) if (!occupied.has(i)) free.push(i);
+    return free;
+  }
+
+  function spawnBlob() {
+    const free = freeSlotIndexes();
+    if (!free.length) return;
+    const slotIdx = free[Math.floor(Math.random() * free.length)];
+    const { weights } = levelParams(level);
+    const species = pickSpecies(weights);
+    play(Math.random() < 0.5 ? 'piu1' : 'piu2');
+    if (species === 'plague') play('plague_in');
+    blobs.push({
+      slotIdx, species,
+      frame: 0, ageMs: 0, hitStage: 0, dead: false, deadAt: 0, born: performance.now(),
+      flinchUntilFrame: 0,
+      tapped: false, resolved: false, plagueOutPlayed: false,
+      redOffsetIdx: 1 + Math.floor(Math.random() * 3), // RED_OFFSETS[1..3]
+    });
+  }
+
+  function relocateBlob(b) {
+    const free = freeSlotIndexes();
+    if (!free.length) return;
+    b.slotIdx = free[Math.floor(Math.random() * free.length)];
+  }
+
+  function loseLife() {
+    lives--;
+    play('red');
+    updateHud();
+    if (lives <= 0) endGame();
+  }
+
+  function scoreHit() {
+    score++;
+    if (score >= nextLevelScore) {
+      level++;
+      nextLevelScore = (level + 1) * 100;
+      play('level'); play('plague_in');
+    }
+    updateHud();
+  }
+
+  function killBlob(b) {
+    b.dead = true; b.deadAt = performance.now();
+    const slot = slots[b.slotIdx];
+    for (let i = 0; i < 14; i++) {
+      const ang = Math.random() * Math.PI * 2, spd = 60 + Math.random() * 160;
+      particles.push({ x: slot.x, y: slot.y, vx: Math.cos(ang) * spd, vy: Math.sin(ang) * spd - 60, life: 450 + Math.random() * 300, born: performance.now(), size: 3 + Math.random() * 5 });
+    }
+  }
+
+  function handleTap(px, py) {
+    if (state !== 'playing') return;
+    for (let i = blobs.length - 1; i >= 0; i--) {
+      const b = blobs[i];
+      if (b.dead) continue;
+      const slot = slots[b.slotIdx];
+      const dx = px - slot.x, dy = py - slot.y;
+      if (dx * dx + dy * dy > (slot.size * 0.5) * (slot.size * 0.5)) continue;
+      if (b.species === 'orangeStart' || b.species === 'plague') {
+        if (b.frame >= GREEN_END) continue; // already turned red -- too late either way
+      } else {
+        if (b.frame >= ORANGE_END) continue; // too late, already turned red -- can't save/stop it by tapping
+      }
+      if (b.species === 'plain' || b.species === 'orangeStart') {
+        play('schlops01');
+        playRandomOuch();
+        scoreHit();
+        killBlob(b);
+      } else if (b.species === 'camo') {
+        // camo: first tap = flinch (clic2x), second tap = kill (random ouch)
+        if (b.hitStage === 0) {
+          b.hitStage = 1;
+          play('clic2x');
+          b.flinchUntilFrame = b.frame + COLOR_STEP_TICKS * 4;
+        } else if (b.hitStage === 1) {
+          playRandomOuch();
+          scoreHit();
+          killBlob(b);
+        }
+      } else if (b.species === 'camoblue') {
+        // ワープ系のハズレ枠: タップしても得点にならず別の穴へ逃げるだけ。
+        // 赤になれば叩いても叩かなくても必ずライフが減る(回避不可能)。
+        if (!b.tapped) {
+          b.tapped = true;
+          play('clic2x');
+          relocateBlob(b);
+        }
+      } else if (b.species === 'plague') {
+        // 罠枠: 触った瞬間に即ライフ減。放置すれば赤になっても無害に消える。
+        if (!b.resolved) {
+          b.resolved = true;
+          play('red');
+          loseLife();
+          killBlob(b);
+        }
+      }
+      return;
+    }
+  }
+  canvas.addEventListener('pointerdown', (e) => {
+    const rect = canvas.getBoundingClientRect();
+    handleTap(e.clientX - rect.left, e.clientY - rect.top);
+  });
+
+  function updateHud() {
+    scoreHud.textContent = 'SCORE ' + score;
+    livesHud.textContent = '♥'.repeat(Math.max(0, lives)) + '♡'.repeat(Math.max(0, 5 - lives));
+  }
+
+  function startGame() {
+    play('go');
+    state = 'playing';
+    score = 0; lives = 5; level = 0; nextLevelScore = 100;
+    blobs = []; particles = []; spawnTimer = 0;
+    titleScreen.hidden = true; resultScreen.hidden = true; hud.hidden = false;
+    updateHud();
+    lastTick = performance.now();
+    requestAnimationFrame(loop);
+  }
+
+  function endGame() {
+    state = 'result';
+    hud.hidden = true;
+    finalScoreEl.textContent = score;
+    const hi = parseInt(localStorage.getItem(HISCORE_KEY) || '0', 10);
+    if (score > hi) {
+      localStorage.setItem(HISCORE_KEY, String(score));
+      hiscoreLine.textContent = 'ハイスコア更新！(前回: ' + hi + ')';
+      play('hiscore');
+    } else {
+      hiscoreLine.textContent = 'ハイスコア: ' + hi;
+      play('failed' + (1 + Math.floor(Math.random() * 3)));
+    }
+    resultScreen.hidden = false;
+  }
+  document.getElementById('startBtn').addEventListener('click', () => { play('button'); startGame(); });
+  document.getElementById('retryBtn').addEventListener('click', () => { play('button'); startGame(); });
+
+  function updateBlobs(dtTicks, dtMs) {
+    for (const b of blobs) {
+      if (b.dead) continue;
+      b.frame += dtTicks;
+      b.ageMs += dtMs;
+      if (b.species === 'plague') {
+        if (!b.plagueOutPlayed && b.frame >= COLOR_STEP_TICKS * 20) {
+          b.plagueOutPlayed = true;
+          play('plague_out');
+        }
+        if (!b.resolved && b.frame >= GREEN_END) {
+          // 放置して赤になった場合は無害。得点もペナルティもなく消える。
+          b.resolved = true;
+          killBlob(b);
+        }
+        continue;
+      }
+      const redAt = (b.species === 'orangeStart') ? GREEN_END : ORANGE_END;
+      if (!b.resolved && b.frame >= redAt) {
+        b.resolved = true; // 回収/処理済みにして二重ペナルティを防ぐ
+        loseLife();
+        killBlob(b);
+      }
+    }
+    blobs = blobs.filter(b => !b.dead || performance.now() - b.deadAt < 220);
+  }
+
+  function spriteFor(b) {
+    if (b.dead) {
+      if (b.species === 'camo') return imgCamo;
+      if (b.species === 'camoblue') return imgCamoBlue;
+      if (b.species === 'plague') return imgPlague;
+      return imgRed;
+    }
+    if (b.species === 'camo') return imgCamo;
+    if (b.species === 'camoblue') return imgCamoBlue;
+    if (b.species === 'plague') return imgPlague;
+    if (b.species === 'orangeStart') return b.frame < GREEN_END ? imgOrange : imgRed;
+    if (b.frame < GREEN_END) return imgGreen;
+    if (b.frame < ORANGE_END) return imgOrange;
+    return imgRed;
+  }
+
+  function spriteOffsetFor(b) {
+    if (b.dead) return [0, 0];
+    if (b.species === 'plague') {
+      return blobOffsetAt(Math.min(23, Math.floor(b.frame / COLOR_STEP_TICKS)));
+    }
+    if (b.species === 'orangeStart') {
+      if (b.frame < GREEN_END) return blobOffsetAt(Math.floor(b.frame / COLOR_STEP_TICKS));
+      return RED_OFFSETS[b.redOffsetIdx];
+    }
+    if (b.species === 'camoblue') {
+      return blobOffsetAt(Math.min(42, Math.floor(b.frame / COLOR_STEP_TICKS))); // 専用の赤絵がなく最終コマのまま
+    }
+    if (b.frame < ORANGE_END) {
+      return blobOffsetAt(Math.floor(b.frame / COLOR_STEP_TICKS));
+    }
+    return RED_OFFSETS[b.redOffsetIdx];
+  }
+
+  function draw(now) {
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = '#9acd00'; ctx.fillRect(0, 0, W, H);
+
+    for (const slot of slots) {
+      const g = ctx.createRadialGradient(slot.x, slot.y, slot.size * 0.1, slot.x, slot.y, slot.size * 0.5);
+      g.addColorStop(0, 'rgba(0,0,0,0.22)'); g.addColorStop(1, 'rgba(0,0,0,0.04)');
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.ellipse(slot.x, slot.y, slot.size * 0.42, slot.size * 0.24, 0, 0, Math.PI * 2); ctx.fill();
+    }
+
+    for (const b of blobs) {
+      const slot = slots[b.slotIdx];
+      let scale = 1;
+      if (b.dead) {
+        const t = (performance.now() - b.deadAt) / 180;
+        scale = Math.max(0, 1 - t) * 1.15;
+      } else {
+        scale = Math.min(1, b.ageMs / 110);
+      }
+      if (scale <= 0) continue;
+      const img = spriteFor(b);
+      const [sx, sy] = spriteOffsetFor(b);
+      const size = slot.size * scale;
+      ctx.save();
+      ctx.translate(slot.x, slot.y - slot.size * 0.12);
+      if (img.complete && img.naturalWidth) {
+        ctx.drawImage(img, sx, sy, FRAME, FRAME, -size / 2, -size / 2, size, size);
+      }
+      // プレイグ(罠枠)は未タップの間だけ警告アイコンを出す -- 触るな、のサイン
+      if (!b.dead && b.species === 'plague' && !b.resolved && imgAvoid.complete && imgAvoid.naturalWidth) {
+        const warnW = size * 0.5, warnH = warnW * (imgAvoid.naturalHeight / imgAvoid.naturalWidth);
+        const bob = Math.sin(now / 160) * size * 0.04;
+        ctx.drawImage(imgAvoid, -warnW / 2, -size / 2 - warnH * 0.7 + bob, warnW, warnH);
+      }
+      ctx.restore();
+    }
+
+    for (let i = particles.length - 1; i >= 0; i--) {
+      const p = particles[i];
+      const t = (now - p.born) / p.life;
+      if (t >= 1) { particles.splice(i, 1); continue; }
+      const x = p.x + p.vx * t, y = p.y + p.vy * t + 300 * t * t;
+      ctx.globalAlpha = 1 - t; ctx.fillStyle = '#6a8a00';
+      ctx.beginPath(); ctx.arc(x, y, p.size * (1 - t * 0.5), 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  function loop(now) {
+    if (state !== 'playing') return;
+    const dtMs = now - lastTick; lastTick = now;
+    // 実機のレンダーループは約30ms間隔(TICK_MS)で1ティック進む。
+    // 出現間隔(interval)もコマ送り(frame)もこのティック基準で統一する。
+    const dtTicks = dtMs / TICK_MS;
+
+    spawnTimer += dtTicks;
+    const { interval } = levelParams(level);
+    if (spawnTimer >= interval) { spawnTimer = 0; spawnBlob(); }
+
+    updateBlobs(dtTicks, dtMs);
+    draw(now);
+
+    if (state === 'playing') requestAnimationFrame(loop);
+  }
+
+  resize();
+  draw(performance.now());
+})();
+</script>
+</body>
+</html>
